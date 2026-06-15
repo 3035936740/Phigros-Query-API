@@ -21,6 +21,11 @@ db:
 #         authorization: "1145141919810893"
 
 server:
+  is-international: false # false: domestic true: international
+  app-id: "rAK3FfdieFob2Nn8Am"
+  app-key: "Qr9AEqtuoSVS3zeD6iVbM4ZC0AtkJcQ89tywVyi0"
+  international-app-id: "kviehleldgxsagpozb"
+  international-app-key: "tG9CTm0LDD736k9HMM9lBZrbeBGRmUkjSfNLDNib"
   data-url: "https://rak3ffdi.cloud.tds1.tapapis.cn" # 鸽游下载存档的url
   data-international-url: "https://kviehlel.cloud.ap-sg.tapapis.com/1.1/" # 鸽游下载存档的国际url
   upload-data-url: "https://upload.qiniup.com" # 鸽游上传存档的url

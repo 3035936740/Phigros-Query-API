@@ -18,6 +18,7 @@
 #include <chrono>
 #include <iomanip>
 #include <cmath>
+#include <algorithm>
 #include "httplib.h"
 #include "configuration/config.hpp"
 #include "common/utils/other_util.hpp"
@@ -111,6 +112,38 @@ namespace self {
 			std::string str(reinterpret_cast<const char*>(&data_[pos_]), strLength);
 			pos_ += strLength;
 			return str;
+		}
+
+		uint64_t ReadVarInt() {
+			uint64_t result{ 0 };
+			uint32_t shift{ 0 };
+			while (pos_ < data_.size()) {
+				const uint8_t byte{ ReadByte() };
+				result |= static_cast<uint64_t>(byte & 0x7F) << shift;
+				if ((byte & 0x80) == 0) {
+					return result;
+				}
+				shift += 7;
+			}
+			throw std::out_of_range("Varint data read out of bounds");
+		}
+
+		void SkipVarInt() {
+			ReadVarInt();
+		}
+
+		std::string ReadVarStr() {
+			const auto strLength{ ReadVarInt() };
+			if (pos_ + strLength > data_.size()) {
+				throw std::out_of_range("String data read out of bounds");
+			}
+			std::string str(reinterpret_cast<const char*>(&data_[pos_]), strLength);
+			pos_ += strLength;
+			return str;
+		}
+
+		size_t remaining() const {
+			return data_.size() - pos_;
 		}
 
 		const auto& getPosition() const {
@@ -269,50 +302,22 @@ namespace self {
 				};
 
 				std::vector<uint8_t> summary = decode_base64(Summary);
-				std::memcpy(&RankingScore, summary.data() + 3, 4);
-				std::memcpy(&ChallengeModeRank, summary.data() + 1, 2);
-
-				//std::cout << "size: " << summary.size() << std::endl;
-				size_t size{ summary.size() }, byte_position{ size - 26 };
-
-				// HexDebug(summary);
-
-				byte_position += 2;
-
-				// EZ
-				for (size_t i = 0; i < 3; ++i)
-				{
-					uint16_t low_byte = summary[byte_position++];
-					uint16_t high_byte = summary[byte_position++];
-					uint16_t ez{ static_cast<uint16_t>((high_byte << 8) | low_byte) };
-					EZ.push_back(ez);
+				if (summary.size() < 8) {
+					throw std::runtime_error("Invalid cloud save summary");
 				}
 
-				// HD
-				for (size_t i = 0; i < 3; ++i)
-				{
-					uint16_t low_byte = summary[byte_position++];
-					uint16_t high_byte = summary[byte_position++];
-					uint16_t hd{ static_cast<uint16_t>((high_byte << 8) | low_byte) };
-					HD.push_back(hd);
-				}
+				BinaryReader reader(summary, false);
+				reader.ReadByte(); // saveVersion
+				ChallengeModeRank = reader.ReadInt16();
+				RankingScore = reader.ReadSingle();
+				reader.ReadVarInt(); // gameVersion
+				reader.ReadVarStr(); // avatar
 
-				// IN
-				for (size_t i = 0; i < 3; ++i)
-				{
-					uint16_t low_byte = summary[byte_position++];
-					uint16_t high_byte = summary[byte_position++];
-					uint16_t in{ static_cast<uint16_t>((high_byte << 8) | low_byte) };
-					IN.push_back(in);
-				}
-
-				// AT
-				for (size_t i = 0; i < 3; ++i)
-				{
-					uint16_t low_byte = summary[byte_position++];
-					uint16_t high_byte = summary[byte_position++];
-					uint16_t at{ static_cast<uint16_t>((high_byte << 8) | low_byte) };
-					AT.push_back(at);
+				std::array<std::vector<uint16_t>*, 4> levels{ &EZ, &HD, &IN, &AT };
+				for (auto* level : levels) {
+					level->push_back(static_cast<uint16_t>(reader.ReadInt16()));
+					level->push_back(static_cast<uint16_t>(reader.ReadInt16()));
+					level->push_back(static_cast<uint16_t>(reader.ReadInt16()));
 				}
 
 				std::tm tm = {};
@@ -334,11 +339,16 @@ namespace self {
 
 
 	private:
-		httplib::Headers m_headers{
-			{"X-LC-Id", "rAK3FfdieFob2Nn8Am"},
-			{"X-LC-Key", "Qr9AEqtuoSVS3zeD6iVbM4ZC0AtkJcQ89tywVyi0"},
-			{"Content-Type", "application/json"}
+		struct TapTapCloudConfig {
+			std::string dataUrl;
+			std::string uploadUrl;
+			std::string saveListUri;
+			std::string appId;
+			std::string appKey;
+			bool isInternational{ false };
 		};
+
+		httplib::Headers m_headers{};
 
 		// progress信息
 		GameProgress m_gameProgress{};
@@ -350,6 +360,7 @@ namespace self {
 
 		std::string
 			m_nickname{},
+			m_userObjectId{},
 			m_sessionToken{};
 
 		std::unordered_map<std::string, std::vector<uint8_t>> m_decodedSaveData{};
@@ -358,16 +369,59 @@ namespace self {
 
 		Json m_player_info, m_game_save_info;
 
-		inline static const std::string
-			URL{ Config::getConfig()["server"]["data-url"].as<std::string>() },
-			UPLOAD_URL{ Config::getConfig()["server"]["upload-data-url"].as<std::string>() };
-
 		const std::string GAME_SAVE_URI{ "/1.1/classes/_GameSave" },
 			ME_URI{ "/1.1/users/me" },
 			FILE_TOKENS_URI{ "/1.1/fileTokens" },
 			FILE_CALLBACK_URI{ "/1.1/fileCallback" },
 			KEY_BASE64{ "6Jaa0qVAJZuXkZCLiOa/Ax5tIZVu+taKUN1V1nqwkks=" },
 			IV_BASE64{ "Kk/wisgNYwcAV8WVGMgyUw==" };
+
+		static std::string trimRightSlash(std::string value) {
+			while (!value.empty() && value.back() == '/') {
+				value.pop_back();
+			}
+			return value;
+		}
+
+		static std::string normalizeLeanCloudBaseUrl(std::string value) {
+			value = trimRightSlash(std::move(value));
+			const std::string api_path{ "/1.1" };
+			if (value.size() >= api_path.size() && value.ends_with(api_path)) {
+				value.erase(value.size() - api_path.size());
+			}
+			return value;
+		}
+
+		static TapTapCloudConfig loadCloudConfig() {
+			auto& config{ Config::getConfig() };
+			TapTapCloudConfig cloud_config;
+			cloud_config.isInternational = config["server"]["is-international"] ?
+				config["server"]["is-international"].as<bool>() : false;
+			cloud_config.dataUrl = normalizeLeanCloudBaseUrl(
+				cloud_config.isInternational ?
+				config["server"]["data-international-url"].as<std::string>() :
+				config["server"]["data-url"].as<std::string>());
+			cloud_config.uploadUrl = trimRightSlash(config["server"]["upload-data-url"].as<std::string>());
+			cloud_config.saveListUri = cloud_config.isInternational ? "/1.1/gamesaves/" : "/1.1/classes/_GameSave";
+			cloud_config.appId = cloud_config.isInternational ?
+				config["server"]["international-app-id"].as<std::string>() :
+				config["server"]["app-id"].as<std::string>();
+			cloud_config.appKey = cloud_config.isInternational ?
+				config["server"]["international-app-key"].as<std::string>() :
+				config["server"]["app-key"].as<std::string>();
+			return cloud_config;
+		}
+
+		static httplib::Headers makeHeaders(const TapTapCloudConfig& cloud_config, const std::string& sessionToken) {
+			return {
+				{"X-LC-Id", cloud_config.appId},
+				{"X-LC-Key", cloud_config.appKey},
+				{"User-Agent", "LeanCloud-CSharp-SDK/1.0.3"},
+				{"Accept", "application/json"},
+				{"Content-Type", "application/json"},
+				{"X-LC-Session", sessionToken}
+			};
+		}
 
 		std::vector<uint8_t> unzip(std::istringstream& iss, const Poco::Zip::ZipLocalFileHeader& header) {
 			Poco::Zip::ZipInputStream zipin(iss, header);
@@ -403,32 +457,18 @@ namespace self {
 			const std::string levels[]{ "EZ", "HD", "IN", "AT", "Legacy" };
 			size_t data_size{ data.size() };
 			std::unordered_map<std::string, std::unordered_map<ubyte, SongScore>> records;
-			BinaryReader reader(data);
+			BinaryReader reader(data, false);
 
-			uint16_t songcount{ 0 };
-			{
-				std::vector<uint8_t> buffer;
-				uint8_t varint_data_1{ reader.ReadByte() };
-				if (varint_data_1 < 0x80) {
-					buffer.push_back(varint_data_1);
-				}
-				else {
-					uint8_t varint_data_2{ reader.ReadByte() };
-					buffer.push_back(varint_data_1);
-					buffer.push_back(varint_data_2);
-				}
-				const uint8_t* buffer_data = buffer.data();
-				songcount = OtherUtil::Varint::read(&buffer_data);
-			}
-			m_user_data.unlocked_count;
+			uint16_t songcount{ static_cast<uint16_t>(reader.ReadVarInt()) };
+			m_user_data.unlocked_count = songcount;
 
 			// std::cout << "songcount" << songcount << std::endl;
 
 			// auto fc{ reader.ReadByte() };
 
-			for (size_t i = 0; i < songcount; ++i) {
-				auto songid{ reader.ReadStr() };
-				auto length{ reader.ReadByte() };
+			for (size_t i = 0; i < songcount && reader.remaining() > 0; ++i) {
+				auto songid{ reader.ReadVarStr() };
+				reader.SkipVarInt();
 				auto diffs{ reader.ReadByte() };
 				auto fc = reader.ReadByte();
 
@@ -440,7 +480,7 @@ namespace self {
 						SongScore song_score;
 						song_score.score = reader.ReadInt32();
 						song_score.acc = reader.ReadSingle();
-						song_score.is_fc = reader.getBit(fc, j);
+						song_score.is_fc = (song_score.score == 1000000 && song_score.acc == 100.0f) || reader.getBit(fc, j);
 						song_score.difficulty = levels[j];
 						record[j] = std::move(song_score);
 					}
@@ -537,16 +577,15 @@ namespace self {
 				// pass
 			} else if (key == "gameProgress") {
 				// HexDebug(data);
-				BinaryReader reader(data);
+				BinaryReader reader(data, false);
 
-				this->m_gameProgress.isFirstRun = reader.ReadByte();
-				this->m_gameProgress.legacyChapterFinished = reader.ReadByte();
-				this->m_gameProgress.alreadyShowCollectionTip = reader.ReadByte();
-				this->m_gameProgress.alreadyShowAutoUnlockINTip = reader.ReadByte();
-				if (this->m_gameProgress.alreadyShowAutoUnlockINTip != 0) {
-					this->m_gameProgress.completed = reader.ReadByte();
-					this->m_gameProgress.songUpdateInfo = reader.ReadByte();
-				}
+				auto progress_flags{ reader.ReadByte() };
+				this->m_gameProgress.isFirstRun = reader.getBit(progress_flags, 0);
+				this->m_gameProgress.legacyChapterFinished = reader.getBit(progress_flags, 1);
+				this->m_gameProgress.alreadyShowCollectionTip = reader.getBit(progress_flags, 2);
+				this->m_gameProgress.alreadyShowAutoUnlockINTip = reader.getBit(progress_flags, 3);
+				this->m_gameProgress.completed = static_cast<uint8_t>(!reader.ReadVarStr().empty());
+				this->m_gameProgress.songUpdateInfo = static_cast<uint8_t>(reader.ReadVarInt());
 				this->m_gameProgress.challengeModeRank = reader.ReadInt16();
 
 				/*
@@ -556,17 +595,7 @@ namespace self {
 				*/
 
 				for (auto& data : this->m_gameProgress.data) {
-					std::vector<uint8_t> buffer;
-					uint8_t varint_data_1{ reader.ReadByte() };
-					if(varint_data_1 < 0x80){
-						buffer.push_back(varint_data_1);
-					} else {
-						uint8_t varint_data_2{ reader.ReadByte() };
-						buffer.push_back(varint_data_1);
-						buffer.push_back(varint_data_2);
-					}
-					const uint8_t* buffer_data = buffer.data();
-					data = OtherUtil::Varint::read(&buffer_data);
+					data = static_cast<short>(reader.ReadVarInt());
 					/*
 					auto front_byte_data{ reader.ReadByte() };
 					// std::cout << std::hex << std::uppercase << std::setw(2) << std::setfill('0') << static_cast<int>(front_byte_data) << ",";
@@ -594,46 +623,22 @@ namespace self {
 				this->m_gameProgress.unlockFlagOfRrharil = reader.ReadByte();
 				this->m_gameProgress.flagOfSongRecordKey = reader.ReadByte();
 				this->m_gameProgress.randomVersionUnlocked = reader.ReadByte();
-				this->m_gameProgress.chapter8UnlockBegin = reader.ReadByte();
-				this->m_gameProgress.chapter8UnlockSecondPhase = reader.ReadByte();
-				if (this->m_gameProgress.chapter8UnlockBegin != 0) {
-					this->m_gameProgress.chapter8Passed = reader.ReadByte();
-					this->m_gameProgress.chapter8SongUnlocked = reader.ReadByte();
-				}
+				auto chapter8_flags{ reader.ReadByte() };
+				this->m_gameProgress.chapter8UnlockBegin = reader.getBit(chapter8_flags, 0);
+				this->m_gameProgress.chapter8UnlockSecondPhase = reader.getBit(chapter8_flags, 1);
+				this->m_gameProgress.chapter8Passed = reader.getBit(chapter8_flags, 2);
+				this->m_gameProgress.chapter8SongUnlocked = reader.ReadByte();
 			} else if (key == "gameRecord") {
 				getGameRecord(data);
 			} else if (key == "settings") {
 				// pass
 			} else if (key == "user") {
-				auto data_size{ data.size() };
-
-				int string_size{ 128 * (data[2] - 1) + data[1] },
-					init_pos{ 3 };
-				if (string_size >= data_size) {
-					init_pos = 2;
-					string_size = data[1];
-				}
 				try {
-					if (static_cast<unsigned long>(init_pos) + string_size > data_size) {
-						throw std::runtime_error("Profile Array Bound Error");
-					}
-					std::string profile(data.begin() + init_pos, data.begin() + init_pos + string_size);
-					this->m_user_data.profile = std::move(profile);
-					auto pos{ std::move(init_pos) + std::move(string_size) };
-					auto avatar_size{ data[pos] };
-
-					if (static_cast<unsigned long>(pos) + avatar_size + 1 > data_size) {
-						throw std::out_of_range("Avatar Array Bound Error");
-					}
-					std::string avatar(data.begin() + pos + 1, data.begin() + pos + avatar_size + 1);
-					this->m_user_data.avatar = std::move(avatar);
-					pos += std::move(avatar_size) + 1;
-					auto background_size{ data[pos] };
-					if (static_cast<unsigned long>(pos) + std::move(background_size) + 1 > data_size) {
-						throw std::out_of_range("Background Array Bound Error");
-					}
-					std::string background(data.begin() + pos + 1, data.begin() + pos + std::move(background_size) + 1);
-					this->m_user_data.background = std::move(background);
+					BinaryReader reader(data, false);
+					reader.ReadByte(); // showPlayerId
+					this->m_user_data.profile = reader.ReadVarStr();
+					this->m_user_data.avatar = reader.ReadVarStr();
+					this->m_user_data.background = reader.ReadVarStr();
 				}
 				catch (const std::out_of_range& e) {
 					LogSystem::logError(e.what());
@@ -688,6 +693,8 @@ namespace self {
 				filename{ "save" };
 			
 			this->m_sessionToken = sessionToken.data();
+			const TapTapCloudConfig cloud_config{ loadCloudConfig() };
+			m_headers = makeHeaders(cloud_config, m_sessionToken);
 
 			std::filesystem::path dir_path{ Global::PlayerSavePath + "/" + m_sessionToken + "/" },
 				file_path{ dir_path / filename };
@@ -695,8 +702,7 @@ namespace self {
 
 			httplib::Error err{ httplib::Error::Success };
 
-			m_headers.insert({ "X-LC-Session", m_sessionToken });
-			web::http::client::http_client client(U(URL));
+			web::http::client::http_client client(U(cloud_config.dataUrl));
 
 			try{
 				// 异步获取玩家自己信息的JSON
@@ -711,7 +717,11 @@ namespace self {
 					auto resp_status_code{ response.status_code() };
 
 					if (resp_status_code == 200) {
-						this->m_nickname = Json::parse(response.extract_json().get().serialize())["nickname"].get<std::string>();
+						auto user_me_resp_str = response.extract_json().get().serialize();
+						auto user_me_resp_json = Json::parse(user_me_resp_str);
+
+						this->m_nickname = user_me_resp_json["nickname"].get<std::string>();
+						this->m_userObjectId = user_me_resp_json["objectId"].get<std::string>();
 					}
 					else if (resp_status_code < 500 && resp_status_code >= 400) {
 						uint16_t status_code = 1;
@@ -730,8 +740,20 @@ namespace self {
 					}
 					});
 
+				get_player_info_thread.get();
+
+				std::string where_clause = "{\"user\":{\"__type\":\"Pointer\",\"className\":\"_User\",\"objectId\":\""
+					+ this->m_userObjectId + "\"}}";
+
+				std::string encoded_where = web::uri::encode_data_string(where_clause);
+
+				std::string save_request_uri = cloud_config.saveListUri
+					+ "?skip=0&limit=100&where=" + encoded_where
+					+ "&include=cover,gameFile";
+
 				web::http::http_request request_add_index(web::http::methods::GET);
-				request_add_index.set_request_uri(GAME_SAVE_URI);
+
+				request_add_index.set_request_uri(save_request_uri);
 				for (auto& [key, value] : m_headers) {
 					request_add_index.headers().add(key, value);
 				}
@@ -739,8 +761,18 @@ namespace self {
 				auto resp_status_code{ response.status_code() };
 				// 获取玩家存档的JSON
 				if (resp_status_code == 200) {
-					this->m_game_save_info = Json::parse(response.extract_json().get().serialize());
-					this->m_game_save_info.swap(this->m_game_save_info["results"][0]);
+					Json game_save_response = Json::parse(response.extract_json().get().serialize());
+					if (!game_save_response.contains("results") || game_save_response["results"].empty()) {
+						throw HTTPException("Cloud save list is empty", 404, 9);
+					}
+					auto selected_save = std::find_if(
+						game_save_response["results"].begin(),
+						game_save_response["results"].end(),
+						[](const Json& item) { return item.contains("gameFile") && !item["gameFile"].is_null(); });
+					if (selected_save == game_save_response["results"].end()) {
+						throw HTTPException("Cloud save file doesn't exist", 404, 9);
+					}
+					this->m_game_save_info = *selected_save;
 
 					// ======================================================================
 					this->m_saveModel.userObjectId = this->m_game_save_info["user"]["objectId"].get<std::string>();
@@ -751,8 +783,7 @@ namespace self {
 				} else {
 					throw HTTPException(""s, 500, 1);
 				}
-
-				get_player_info_thread.get();
+				
 			} catch (const nlohmann::json::type_error&) {
 				// plan B启动
 				if (Global::IsPlanB)
@@ -795,6 +826,13 @@ namespace self {
 			}
 			else if (result_zip->status != 200) {
 				throw HTTPException(httplib::to_string(err), 500, 1);
+			}
+			const std::string actual_checksum{ OtherUtil::stringToMD5(result_zip->body) };
+			if (!this->m_saveModel.checksum.empty() && this->m_saveModel.checksum != actual_checksum) {
+				throw HTTPException(
+					"Cloud save checksum mismatch: expected "s + this->m_saveModel.checksum + ", actual " + actual_checksum,
+					500,
+					1);
 			}
 
 			// ==========================================
@@ -863,7 +901,7 @@ namespace self {
 		auto GetSummary() const {
 			return CloudSaveSummary(
 				this->m_game_save_info["summary"].get<std::string>(),
-				this->m_game_save_info["gameFile"]["createdAt"].get<std::string>(),
+				this->m_game_save_info["updatedAt"].get<std::string>(),
 				this->m_nickname);
 		};
 
@@ -884,6 +922,7 @@ namespace self {
 		}
 
 		auto upload(const std::string& body) {
+			const TapTapCloudConfig cloud_config{ loadCloudConfig() };
 			std::size_t dataSize = body.size();
 			std::string dataMD5 = OtherUtil::stringToMD5(body);
 			// this->m_dataSize = body.size();
@@ -891,7 +930,7 @@ namespace self {
 			Json resFileToken{};
 
 			{
-				web::http::client::http_client client(U(URL));
+				web::http::client::http_client client(U(cloud_config.dataUrl));
 				web::http::http_request request_add_index(web::http::methods::POST);
 				request_add_index.set_request_uri(FILE_TOKENS_URI);
 				for (auto& [key, value] : m_headers){
@@ -938,7 +977,7 @@ namespace self {
 
 			std::string uploadId{};
 			{
-				web::http::client::http_client client(U(UPLOAD_URL));
+				web::http::client::http_client client(U(cloud_config.uploadUrl));
 				web::http::http_request request_add_index(web::http::methods::POST);
 				request_add_index.set_request_uri(std::format("/buckets/rAK3Ffdi/objects/{}/uploads", tokenKeyB64));
 				request_add_index.headers().add("Authorization", authorization);
@@ -959,7 +998,7 @@ namespace self {
 			
 			std::string etag{};
 			{
-				web::http::client::http_client client(U(UPLOAD_URL));
+				web::http::client::http_client client(U(cloud_config.uploadUrl));
 				web::http::http_request request_add_index(web::http::methods::PUT);
 				request_add_index.set_request_uri(std::format("/buckets/rAK3Ffdi/objects/{}/uploads/{}/1", tokenKeyB64, uploadId));
 				request_add_index.headers().add("Authorization", authorization);
@@ -981,7 +1020,7 @@ namespace self {
 			// fmt::print("\netag: {}\n", etag);
 
 			{
-				web::http::client::http_client client(U(UPLOAD_URL));
+				web::http::client::http_client client(U(cloud_config.uploadUrl));
 				web::http::http_request request_add_index(web::http::methods::POST);
 				request_add_index.set_request_uri(std::format("/buckets/rAK3Ffdi/objects/{}/uploads/{}", tokenKeyB64, uploadId));
 				request_add_index.headers().add("Authorization", authorization);
@@ -1001,7 +1040,7 @@ namespace self {
 			}
 
 			{
-				web::http::client::http_client client(U(URL));
+				web::http::client::http_client client(U(cloud_config.dataUrl));
 				web::http::http_request request_add_index(web::http::methods::POST);
 				request_add_index.set_request_uri(FILE_CALLBACK_URI);
 				for (auto& [key, value] : m_headers) {
@@ -1035,7 +1074,7 @@ namespace self {
 				// oss.str()
 
 				// 发送请求
-				web::http::client::http_client client(U(URL));
+				web::http::client::http_client client(U(cloud_config.dataUrl));
 				web::http::http_request request_add_index(web::http::methods::PUT);
 				request_add_index.set_request_uri("/1.1/classes/_GameSave/" + this->m_saveModel.objectId + "?");
 				for (auto& [key, value] : m_headers) {
@@ -1058,7 +1097,7 @@ namespace self {
 			}
 
 			{
-				web::http::client::http_client client(U(URL));
+				web::http::client::http_client client(U(cloud_config.dataUrl));
 				web::http::http_request request_add_index(web::http::methods::DEL);
 				request_add_index.set_request_uri("/1.1/files/" + this->m_saveModel.gameObjectId);
 				for (auto& [key, value] : m_headers) {
