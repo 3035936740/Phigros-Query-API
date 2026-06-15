@@ -37,15 +37,38 @@ if __name__ == "__main__":
             musicInfo = single.strip().split('\t', 8)
             if len(musicInfo) < 8:
                 musicInfo.append(None)
-                
+            
+            sid = musicInfo[0]
+            title = musicInfo[1]
+            artist = musicInfo[2]
+            illustration = musicInfo[3]
+            charts = [musicInfo[4], musicInfo[5], musicInfo[6], musicInfo[7]] # EZ, HD, ID ,AT
+            
             info = {
-                "sid": musicInfo[0],
-                "title": musicInfo[1],
-                "artist": musicInfo[2],
-                "illustration": musicInfo[3],
-                "charts": [musicInfo[4], musicInfo[5], musicInfo[6], musicInfo[7]]
+                "sid": sid,
+                "title": title,
+                "artist": artist,
+                "illustration": illustration,
+                "charts": charts
             }
-            musicInfos[f"{musicInfo[0]}.0"] = info
+            
+            key = f"{musicInfo[0]}.0"
+            curr_level = levels[key] # EZ, HD, ID ,AT
+            
+            musicInfos[key] = info
+            info = conn.execute(f'SELECT * FROM phigros WHERE sid = "{key}"').fetchall()
+            if len(info) == 0:
+                print(f"Insert new song {key}")
+                insert_sql = f'''INSERT INTO phigros(sid,title,
+rating_ez,rating_hd,rating_in,rating_at,
+design_ez,design_hd,design_in,design_at,
+artist,illustration) VALUES ("{key}","{title}",
+{curr_level[0] if curr_level[0] else "null"},{curr_level[1] if curr_level[1] else "null"},{curr_level[2] if curr_level[2] else "null"},{curr_level[3] if curr_level[3] else "null"},
+"{charts[0] if charts[0] else "null"}","{charts[1] if charts[1] else "null"}","{charts[2] if charts[2] else "null"}","{charts[3] if charts[3] else "null"}",
+"{artist}","{illustration}")'''.replace('\\"', '""')
+                print(insert_sql)
+                conn.execute(insert_sql)
+                conn.commit()
     
     for key, value in levels.items():
         info = conn.execute(f'SELECT * FROM phigros WHERE sid = "{key}"').fetchall()

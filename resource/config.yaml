@@ -22,6 +22,7 @@ db:
 
 server:
   data-url: "https://rak3ffdi.cloud.tds1.tapapis.cn" # 鸽游下载存档的url
+  data-international-url: "https://kviehlel.cloud.ap-sg.tapapis.com/1.1/" # 鸽游下载存档的国际url
   upload-data-url: "https://upload.qiniup.com" # 鸽游上传存档的url
   concurrency: 0 # 0为根据系统默认设置线程,>0的是启用的线程数量
   port: 8399 # 启用端口

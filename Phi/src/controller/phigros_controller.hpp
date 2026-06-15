@@ -59,6 +59,15 @@ public:
 	virtual ~PhigrosController() = default;
 
 	const inline void controller(void) {
+		CROW_ROUTE(m_app, "/phi/reload")
+			.methods("GET"_method)([&](const crow::request& req) {
+			crow::response resp;
+			SQL_Util::initialized();
+			resp.set_header("Content-Type", "application/json");
+			resp.write(StatusCodeHandle::getSimpleJsonResult(200));
+			return resp;
+				});
+
 		CROW_ROUTE(m_app, "/phi/all")
 			.methods("GET"_method)([&](const crow::request& req) {
 			crow::response resp;
